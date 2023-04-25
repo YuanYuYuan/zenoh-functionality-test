@@ -2,11 +2,15 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
+use anyhow::bail;
 use async_std::prelude::FutureExt;
-use futures::future::join_all;
-use futures::select;
+use futures::future::{join_all, select_all};
+use futures::{select, FutureExt};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use async_std::task;
@@ -23,16 +27,10 @@ macro_rules! ztimeout {
 }
 
 #[derive(Debug)]
-enum Action {
-    Pub,
-    Sub,
-    Park,
-}
-
-#[derive(Debug)]
-struct Task {
-    topic: String,
-    action: Action,
+enum Task {
+    Pub(String, usize),
+    Sub(String, usize),
+    Sleep,
 }
 
 #[derive(Debug)]
@@ -44,39 +42,45 @@ struct Node {
     task: Vec<Task>,
 }
 
+impl Default for Node {
+    fn default() -> Self {
+        Self {
+            name: "TestNode".into(),
+            mode: WhatAmI::Peer,
+            listen: vec![],
+            connect: vec![],
+            task: vec![],
+        }
+    }
+}
+
 #[async_std::main]
 async fn main() {
     let nodes = vec![
-        // Node {
-        //     name: "C:Router".into(),
-        //     mode: WhatAmI::Router,
-        //     listen: vec!["tcp/127.0.0.1:17447".into()],
-        //     connect: vec![],
-        //     task: vec![],
-        // },
+        Node {
+            name: "C:Router".into(),
+            mode: WhatAmI::Router,
+            listen: vec!["tcp/127.0.0.1:17447".into()],
+            task: vec![Task::Sleep],
+            ..Default::default()
+        },
         Node {
             name: "A:PubClient".into(),
-            mode: WhatAmI::Peer,
-            // listen: vec![],
-            listen: vec!["tcp/127.0.0.1:17447".into()],
-            // connect: vec!["tcp/127.0.0.1:17447".into()],
-            connect: vec![],
-            task: vec![Task {
-                topic: "myTestTopic".into(),
-                action: Action::Pub,
-            }],
+            connect: vec!["tcp/127.0.0.1:17447".into()],
+            mode: WhatAmI::Client,
+            task: vec![Task::Pub("myTestTopic".into(), 8)],
+            ..Default::default()
         },
         Node {
             name: "B:SubClient".into(),
             mode: WhatAmI::Client,
-            listen: vec![],
             connect: vec!["tcp/127.0.0.1:17447".into()],
-            task: vec![Task {
-                topic: "myTestTopic".into(),
-                action: Action::Sub,
-            }],
+            task: vec![Task::Sub("myTestTopic".into(), 8)],
+            ..Default::default()
         },
     ];
+
+    // let terminated = Arc::new(AtomicBool::new(false));
 
     let futures = nodes.into_iter().map(|node| async move {
         dbg!(node.name);
@@ -94,42 +98,60 @@ async fn main() {
         let session = Arc::new(ztimeout!(zenoh::open(config).res_async()).unwrap());
         async_std::task::sleep(SLEEP).await;
 
-        let futs = node.task.into_iter().map(|Task { topic, action }| {
+        let futs = node.task.into_iter().map(|task| {
             let c_session = session.clone();
-            match action {
-                Action::Sub => {
+            let fut = match task {
+                Task::Sub(topic, payload_size) => {
                     dbg!("Subscription passed.");
                     async_std::task::spawn(async move {
                         let sub =
                             ztimeout!(c_session.declare_subscriber(&topic).res_async()).unwrap();
 
+                        let mut counter = 0;
                         while let Ok(sample) = sub.recv_async().await {
+                            assert_eq!(sample.value.payload.len(), payload_size);
+                            counter += 1;
+                            if counter >= 5 {
+                                // terminated.store(true, Ordering::Relaxed);
+                                break;
+                            }
                             println!("Received : {:?}", sample);
                         }
-                        dbg!("here...");
+                        println!("Terminated");
+                        // Ok(())
                     })
                 }
-                Action::Pub => {
+                Task::Pub(topic, payload_size) => {
                     dbg!("Publishment passed.");
                     async_std::task::spawn(async move {
+                        // while terminated.into_inner() {
                         loop {
                             // dbg!("looping...");
                             async_std::task::sleep(Duration::from_millis(300)).await;
                             ztimeout!(c_session
-                                .put(&topic, vec![0u8; 8])
+                                .put(&topic, vec![0u8; payload_size])
                                 .congestion_control(CongestionControl::Block)
                                 .res_async())
                             .unwrap();
                         }
+                        // Ok(())
                     })
                 }
-                Action::Park => {
-
-                }
-            }
+                Task::Sleep => async_std::task::spawn(async move {
+                    async_std::task::sleep(Duration::from_secs(30)).await;
+                    // Ok(())
+                }),
+            };
+            fut
         });
-        join_all(futs).await
+
+        // futs
+        // join_all(futs).await;
+        // let (x, y, z) = select_all(futs).boxed();
+        select_all(futs)
+        // Ok(())
     });
-    join_all(futures).await;
+
+    select_all(futures).await;
     dbg!("Done");
 }
