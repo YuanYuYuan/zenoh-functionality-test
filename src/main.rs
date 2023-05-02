@@ -3,9 +3,11 @@
 #![allow(unused_imports)]
 
 use anyhow::bail;
-use async_std::prelude::FutureExt;
 use futures::future::{join_all, select_all};
-use futures::{select, FutureExt};
+use futures::{
+    select,
+    FutureExt as _,
+};
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -14,15 +16,17 @@ use std::sync::{
 use std::time::Duration;
 
 use async_std::task;
+use async_std::prelude::FutureExt;
 use zenoh::config::{whatami::WhatAmI, Config, EndPoint};
 use zenoh::prelude::r#async::*;
+use zenoh::Result;
 
-const TIMEOUT: Duration = Duration::from_secs(60);
+const TIMEOUT: Duration = Duration::from_secs(10);
 const SLEEP: Duration = Duration::from_secs(1);
 
 macro_rules! ztimeout {
     ($f:expr) => {
-        $f.timeout(TIMEOUT).await.unwrap()
+        $f.timeout(TIMEOUT).await?
     };
 }
 
@@ -54,8 +58,9 @@ impl Default for Node {
     }
 }
 
+
 #[async_std::main]
-async fn main() {
+async fn main() -> Result<()> {
     let nodes = vec![
         Node {
             name: "C:Router".into(),
@@ -84,6 +89,8 @@ async fn main() {
 
     let futures = nodes.into_iter().map(|node| async move {
         dbg!(node.name);
+
+        // Load the config and build up a session
         let mut config = Config::default();
         config.set_mode(Some(node.mode)).unwrap();
         config.scouting.multicast.set_enabled(Some(false)).unwrap();
@@ -95,7 +102,8 @@ async fn main() {
             .connect
             .set_endpoints(node.connect.iter().map(|x| x.parse().unwrap()).collect())
             .unwrap();
-        let session = Arc::new(ztimeout!(zenoh::open(config).res_async()).unwrap());
+        let session = Arc::new(ztimeout!(zenoh::open(config).res_async())?);
+
         async_std::task::sleep(SLEEP).await;
 
         let futs = node.task.into_iter().map(|task| {
@@ -105,7 +113,7 @@ async fn main() {
                     dbg!("Subscription passed.");
                     async_std::task::spawn(async move {
                         let sub =
-                            ztimeout!(c_session.declare_subscriber(&topic).res_async()).unwrap();
+                            ztimeout!(c_session.declare_subscriber(&topic).res_async())?;
 
                         let mut counter = 0;
                         while let Ok(sample) = sub.recv_async().await {
@@ -118,7 +126,7 @@ async fn main() {
                             println!("Received : {:?}", sample);
                         }
                         println!("Terminated");
-                        // Ok(())
+                        Result::Ok(())
                     })
                 }
                 Task::Pub(topic, payload_size) => {
@@ -131,15 +139,14 @@ async fn main() {
                             ztimeout!(c_session
                                 .put(&topic, vec![0u8; payload_size])
                                 .congestion_control(CongestionControl::Block)
-                                .res_async())
-                            .unwrap();
+                                .res_async())?;
                         }
-                        // Ok(())
+                        Ok(())
                     })
                 }
                 Task::Sleep => async_std::task::spawn(async move {
                     async_std::task::sleep(Duration::from_secs(30)).await;
-                    // Ok(())
+                    Ok(())
                 }),
             };
             fut
@@ -148,10 +155,15 @@ async fn main() {
         // futs
         // join_all(futs).await;
         // let (x, y, z) = select_all(futs).boxed();
-        select_all(futs)
-        // Ok(())
-    });
+        let (state, _, _) = select_all(futs).await;
+        state
+    }.boxed());
 
-    select_all(futures).await;
-    dbg!("Done");
+    let (state, _, _) = select_all(futures).await;
+    if let Ok(state) = state {
+        println!("Done");
+    } else {
+        println!("Failed");
+    }
+    Ok(())
 }
