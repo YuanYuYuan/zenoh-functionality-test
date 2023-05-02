@@ -2,12 +2,8 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
-use anyhow::bail;
 use futures::future::{join_all, select_all};
-use futures::{
-    select,
-    FutureExt as _,
-};
+use futures::{select, FutureExt as _};
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -15,11 +11,13 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use async_std::task;
 use async_std::prelude::FutureExt;
+use async_std::task;
 use zenoh::config::{whatami::WhatAmI, Config, EndPoint};
 use zenoh::prelude::r#async::*;
 use zenoh::Result;
+use zenoh_result::bail;
+// use zenoh::Result;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const SLEEP: Duration = Duration::from_secs(1);
@@ -34,7 +32,7 @@ macro_rules! ztimeout {
 enum Task {
     Pub(String, usize),
     Sub(String, usize),
-    Sleep,
+    Sleep(Duration),
 }
 
 #[derive(Debug)]
@@ -58,36 +56,8 @@ impl Default for Node {
     }
 }
 
-
-#[async_std::main]
-async fn main() -> Result<()> {
-    let nodes = vec![
-        Node {
-            name: "C:Router".into(),
-            mode: WhatAmI::Router,
-            listen: vec!["tcp/127.0.0.1:17447".into()],
-            task: vec![Task::Sleep],
-            ..Default::default()
-        },
-        Node {
-            name: "A:PubClient".into(),
-            connect: vec!["tcp/127.0.0.1:17447".into()],
-            mode: WhatAmI::Client,
-            task: vec![Task::Pub("myTestTopic".into(), 8)],
-            ..Default::default()
-        },
-        Node {
-            name: "B:SubClient".into(),
-            mode: WhatAmI::Client,
-            connect: vec!["tcp/127.0.0.1:17447".into()],
-            task: vec![Task::Sub("myTestTopic".into(), 8)],
-            ..Default::default()
-        },
-    ];
-
-    // let terminated = Arc::new(AtomicBool::new(false));
-
-    let futures = nodes.into_iter().map(|node| async move {
+async fn run_recipe(receipe: impl IntoIterator<Item = Node>) -> Result<()> {
+    let futures = receipe.into_iter().map(|node| async move {
         dbg!(node.name);
 
         // Load the config and build up a session
@@ -102,68 +72,104 @@ async fn main() -> Result<()> {
             .connect
             .set_endpoints(node.connect.iter().map(|x| x.parse().unwrap()).collect())
             .unwrap();
-        let session = Arc::new(ztimeout!(zenoh::open(config).res_async())?);
 
-        async_std::task::sleep(SLEEP).await;
+        // In case of client can't connect to some peers/routers
+        let session = if let Ok(session) = zenoh::open(config.clone()).res_async().await {
+            Arc::new(session)
+        } else {
+            // Sleep one second and retry
+            async_std::task::sleep(Duration::from_secs(1)).await;
+            Arc::new(zenoh::open(config).res_async().await?)
+        };
 
+        // Each node consists of a specified session associated with tasks to run
         let futs = node.task.into_iter().map(|task| {
+
+            // Each session spawns several given task(s)
             let c_session = session.clone();
             let fut = match task {
-                Task::Sub(topic, payload_size) => {
-                    dbg!("Subscription passed.");
+
+                // Subscription task
+                Task::Sub(topic, expected_size) => {
                     async_std::task::spawn(async move {
                         let sub =
                             ztimeout!(c_session.declare_subscriber(&topic).res_async())?;
 
                         let mut counter = 0;
                         while let Ok(sample) = sub.recv_async().await {
-                            assert_eq!(sample.value.payload.len(), payload_size);
+                            let recv_size = sample.value.payload.len();
+                            if recv_size != expected_size {
+                                bail!("Received payload size {recv_size} mismatches the expected {expected_size}");
+                            }
                             counter += 1;
+                            println!("Received : {:?}", sample);
                             if counter >= 5 {
-                                // terminated.store(true, Ordering::Relaxed);
                                 break;
                             }
-                            println!("Received : {:?}", sample);
                         }
-                        println!("Terminated");
                         Result::Ok(())
                     })
                 }
+
+                // Publishment task
                 Task::Pub(topic, payload_size) => {
-                    dbg!("Publishment passed.");
                     async_std::task::spawn(async move {
-                        // while terminated.into_inner() {
                         loop {
-                            // dbg!("looping...");
                             async_std::task::sleep(Duration::from_millis(300)).await;
                             ztimeout!(c_session
                                 .put(&topic, vec![0u8; payload_size])
                                 .congestion_control(CongestionControl::Block)
                                 .res_async())?;
                         }
-                        Ok(())
                     })
                 }
-                Task::Sleep => async_std::task::spawn(async move {
-                    async_std::task::sleep(Duration::from_secs(30)).await;
+
+                // Sleep a while according to the given duration
+                Task::Sleep(dur) => async_std::task::spawn(async move {
+                    async_std::task::sleep(dur).await;
                     Ok(())
                 }),
             };
             fut
         });
 
-        // futs
-        // join_all(futs).await;
-        // let (x, y, z) = select_all(futs).boxed();
         let (state, _, _) = select_all(futs).await;
         state
     }.boxed());
 
-    let (state, _, _) = select_all(futures).await;
-    if let Ok(state) = state {
-        println!("Done");
-    } else {
-        println!("Failed");
-    }
+    let (state, _, _) = select_all(futures).timeout(TIMEOUT).await?;
+    Ok(state?)
+}
+
+#[async_std::main]
+async fn main() -> Result<()> {
+    let locator = String::from("tcp/127.0.0.1:17447");
+    let topic = String::from("testTopic");
+    let recipe = [
+        Node {
+            name: "C:Router".into(),
+            mode: WhatAmI::Router,
+            listen: vec![locator.clone()],
+            task: vec![Task::Sleep(Duration::from_secs(30))],
+            ..Default::default()
+        },
+        Node {
+            name: "A:PubClient".into(),
+            connect: vec![locator.clone()],
+            mode: WhatAmI::Client,
+            task: vec![Task::Pub(topic.clone(), 8)],
+            ..Default::default()
+        },
+        Node {
+            name: "B:SubClient".into(),
+            mode: WhatAmI::Client,
+            connect: vec![locator.clone()],
+            task: vec![Task::Sub(topic.clone(), 8)],
+            ..Default::default()
+        },
+    ];
+
+    run_recipe(recipe).await?;
+    println!("Test passed.");
     Ok(())
 }
