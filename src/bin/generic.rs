@@ -1,26 +1,19 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
+// #![allow(dead_code)]
+// #![allow(unused_variables)]
+// #![allow(unused_imports)]
 
-use futures::future::{join_all, select_all};
-use futures::{select, FutureExt as _};
-use std::str::FromStr;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use futures::future::select_all;
+use futures::FutureExt as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_std::prelude::FutureExt;
-use async_std::task;
-use zenoh::config::{whatami::WhatAmI, Config, EndPoint};
+use zenoh::config::{whatami::WhatAmI, Config};
 use zenoh::prelude::r#async::*;
 use zenoh::Result;
 use zenoh_result::bail;
-// use zenoh::Result;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-const SLEEP: Duration = Duration::from_secs(1);
 
 macro_rules! ztimeout {
     ($f:expr) => {
@@ -74,7 +67,8 @@ async fn run_recipe(receipe: impl IntoIterator<Item = Node>) -> Result<()> {
             .unwrap();
 
         // In case of client can't connect to some peers/routers
-        let session = if let Ok(session) = zenoh::open(config.clone()).res_async().await {
+        let session = if let Ok(session) =
+        zenoh::open(config.clone()).res_async().await {
             Arc::new(session)
         } else {
             // Sleep one second and retry
@@ -98,9 +92,7 @@ async fn run_recipe(receipe: impl IntoIterator<Item = Node>) -> Result<()> {
                         let mut counter = 0;
                         while let Ok(sample) = sub.recv_async().await {
                             let recv_size = sample.value.payload.len();
-                            if recv_size != expected_size {
-                                bail!("Received payload size {recv_size} mismatches the expected {expected_size}");
-                            }
+                            if recv_size != expected_size { bail!("Received payload size {recv_size} mismatches the expected {expected_size}"); }
                             counter += 1;
                             println!("Received : {:?}", sample);
                             if counter >= 5 {
@@ -145,31 +137,60 @@ async fn run_recipe(receipe: impl IntoIterator<Item = Node>) -> Result<()> {
 async fn main() -> Result<()> {
     let locator = String::from("tcp/127.0.0.1:17447");
     let topic = String::from("testTopic");
+
+    // Gossip test
     let recipe = [
         Node {
-            name: "C:Router".into(),
-            mode: WhatAmI::Router,
+            name: "C".into(),
+            mode: WhatAmI::Peer,
             listen: vec![locator.clone()],
             task: vec![Task::Sleep(Duration::from_secs(30))],
             ..Default::default()
         },
         Node {
-            name: "A:PubClient".into(),
+            name: "A".into(),
             connect: vec![locator.clone()],
-            mode: WhatAmI::Client,
+            mode: WhatAmI::Peer,
             task: vec![Task::Pub(topic.clone(), 8)],
             ..Default::default()
         },
         Node {
-            name: "B:SubClient".into(),
-            mode: WhatAmI::Client,
+            name: "B".into(),
+            mode: WhatAmI::Peer,
             connect: vec![locator.clone()],
             task: vec![Task::Sub(topic.clone(), 8)],
             ..Default::default()
         },
     ];
-
     run_recipe(recipe).await?;
-    println!("Test passed.");
+    println!("Gossip test passed.");
+
+    // Gossip
+    let recipe = [
+        Node {
+            name: "C".into(),
+            mode: WhatAmI::Peer,
+            listen: vec![locator.clone()],
+            task: vec![Task::Sleep(Duration::from_secs(30))],
+            ..Default::default()
+        },
+        Node {
+            name: "A".into(),
+            connect: vec![locator.clone()],
+            mode: WhatAmI::Peer,
+            task: vec![Task::Pub(topic.clone(), 8)],
+            ..Default::default()
+        },
+        Node {
+            name: "B".into(),
+            mode: WhatAmI::Peer,
+            connect: vec![locator.clone()],
+            task: vec![Task::Sub(topic.clone(), 8)],
+            ..Default::default()
+        },
+    ];
+    run_recipe(recipe).await?;
+    println!("Gossip test passed.");
+
     Ok(())
 }
